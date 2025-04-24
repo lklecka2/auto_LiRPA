@@ -527,3 +527,84 @@ class PerturbationSynonym(Perturbation):
                     candidates.append(_cand)
                 example['candidates'] = candidates
 
+class PerturbationTopo(Perturbation):
+    r"""
+    Topological (edge–flip / swap) perturbation.
+    """
+
+    def __init__(self, allowed_swaps: int = 1, x_L=None, x_U=None):
+        super().__init__()
+        if allowed_swaps < 0:
+            raise ValueError('allowed_swaps must be non-negative')
+        self.allowed_swaps = int(allowed_swaps)
+        self.x_L, self.x_U = x_L, x_U
+
+    def init(self, x: torch.Tensor, aux=None, forward: bool = False):
+        x_L = torch.zeros_like(x) if self.x_L is None else self.x_L
+        x_U = torch.ones_like (x) if self.x_U is None else self.x_U
+
+        if not forward:
+            return LinearBound(None, None, None, None, x_L, x_U), x, aux
+
+        batch, dim = x.shape[0], x.reshape(x.shape[0], -1).shape[-1]
+        eye  = torch.eye(dim, device=x.device).expand(batch, dim, dim)
+        lw = uw = eye.reshape(batch, dim, *x.shape[1:])
+        lb = ub = torch.zeros_like(x)
+        return LinearBound(lw, lb, uw, ub, x_L, x_U), x, aux
+
+    def _worst_change(self, A: torch.Tensor, x: torch.Tensor,
+                      sign: int) -> torch.Tensor:
+        k = self.allowed_swaps
+        if k == 0:
+            return torch.zeros_like(A[..., 0])
+
+        delta = (1.0 - 2.0 * x.unsqueeze(1)) * A
+
+        benefit = sign * delta
+        benefit = torch.clamp(benefit, min=0.0)
+
+        topk, _ = torch.topk(benefit, k=min(k, benefit.size(-1)),
+                             dim=-1, largest=True, sorted=False)
+        return topk.sum(dim=-1)
+
+    def concretize(self, x: torch.Tensor, A, sign: int = -1, aux=None):
+        if A is None:
+            return None
+        if sign not in (-1, +1):
+            raise ValueError('sign must be ±1')
+
+        batch = x.shape[0]
+        x_flat = x.reshape(batch, -1)
+
+        if isinstance(A, torch.Tensor):
+            center = A.matmul(x_flat.unsqueeze(-1)).squeeze(-1)
+            worst  = self._worst_change(A, x_flat, sign)
+            return center + sign * worst
+
+        if isinstance(A, eyeC):
+            dim  = x_flat.size(1)
+            idx  = torch.arange(dim, device=x.device).repeat(batch, 1)
+            A_id = torch.nn.functional.one_hot(idx, num_classes=dim)\
+                     .to(x.dtype).unsqueeze(1)
+            center = x_flat.unsqueeze(1)
+            center = center.squeeze(-1)
+            worst  = self._worst_change(A_id, x_flat, sign)
+            bound  = center + sign * worst
+            return bound
+
+        if isinstance(A, Patches):
+            from .patches import patches_to_matrix
+            matrix = patches_to_matrix(
+                A.patches, x.shape, A.stride, A.padding,
+                A.output_shape, A.unstable_idx
+            )
+            matrix = matrix.reshape(matrix.shape[0], matrix.shape[1], -1)
+            center = torch.bmm(matrix, x_flat.unsqueeze(-1)).squeeze(-1)
+            worst  = self._worst_change(matrix, x_flat, sign)
+            return center + sign * worst
+
+        raise NotImplementedError(
+            f"PerturbationTopo does not understand A of type {type(A)}")
+
+    def __repr__(self):
+        return f'PerturbationTopo(allowed_swaps={self.allowed_swaps})'
